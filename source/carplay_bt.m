@@ -168,6 +168,8 @@ static int handoff_watchdog_armed = 0;
 static unsigned int handoff_generation = 0;
 static char wifi_ipv6[INET6_ADDRSTRLEN] = "";
 static int packet_debug_count = 0;
+static uint8_t iap2_rx[UINT16_MAX], control_rx[UINT16_MAX];
+static size_t iap2_rx_len = 0, control_rx_len = 0;
 
 static void reset_wireless_handoff_state(void) {
     handoff_generation++;
@@ -184,6 +186,7 @@ static void reset_wireless_handoff_state(void) {
     mfi_auth_succeeded = 0;
     handoff_watchdog_armed = 0;
     wifi_ipv6[0] = '\0';
+    iap2_rx_len = control_rx_len = 0;
 }
 
 /* ═══════════════════════════════════════════════
@@ -408,6 +411,11 @@ static uint8_t ck(uint8_t *d, int l) {
 static void print_hci_addr(const char *prefix, const uint8_t *raw) {
     printf("%s%02X:%02X:%02X:%02X:%02X:%02X",
            prefix, raw[5], raw[4], raw[3], raw[2], raw[1], raw[0]);
+}
+
+static void read_hci_addr(bd_addr_t address, const uint8_t *raw) {
+    /* HCI events use little-endian addresses; BTstack commands expect display order. */
+    for (int i = 0; i < 6; i++) address[i] = raw[5 - i];
 }
 
 static void rfcomm_send_chunked(uint8_t *data, int len) {
@@ -1159,6 +1167,103 @@ static void handle_ctrl_msg(uint16_t msg_id, uint8_t *params, int plen) {
 /* ═══════════════════════════════════════════════
  *  BTstack packet handler
  * ═══════════════════════════════════════════════ */
+static void handle_iap2_packet(uint8_t *pkt, uint16_t sz) {
+    if(sz>=6&&memcmp(pkt,iap2_detect,6)==0&&!iap2_detected) {
+        printf("[CP] *** DETECT ECHO ***\n");
+        iap2_detected=1; alarm(0);
+        srand(time(NULL));
+        my_initial_psn=(rand()%254)+1;
+        if (my_initial_psn == 0xFF) my_initial_psn = 0x7F;
+        my_next_psn=my_initial_psn+1;
+        send_syn(); return;
+    }
+    if(sz>=9&&pkt[0]==0xFF&&pkt[1]==0x5A) {
+        uint8_t ctrl=pkt[4],seq=pkt[5],ack=pkt[6],session=pkt[7];
+        if(ctrl==0x10){
+            printf("[CP] RST\n"); link_established=0; control_rx_len=0; usleep(500000);
+            my_initial_psn=(rand()%254)+1;
+            if (my_initial_psn == 0xFF) my_initial_psn = 0x7F;
+            my_next_psn=my_initial_psn+1;
+            send_syn(); return;
+        }
+        if((ctrl&0xC0)==0xC0&&!link_established) {
+            peer_psn=seq;
+            printf("[SYN-ACK] seq=0x%02X ack=0x%02X\n", seq, ack);
+            if(sz>9) {
+                printf("[SYN-ACK] payload(%d):", sz-9);
+                for(int i=9;i<sz&&i<40;i++) printf(" %02X",pkt[i]);
+                printf("\n");
+            }
+            if(ack==my_initial_psn){send_ack();link_established=1;printf("[CP] *** LINK UP ***\n");}
+            return;
+        }
+        if(link_established&&(ctrl&0x40)&&session!=0&&sz>10) {
+            if (seq == peer_psn) { send_ack(); return; }
+            if (seq != (uint8_t)(peer_psn + 1)) { send_ack(); return; }
+            peer_psn=seq;
+            send_ack();
+            if (session == 1) {
+                for (int i = 9; i < sz - 1; i++) {
+                    control_rx[control_rx_len++] = pkt[i];
+                    if (control_rx_len < 6) continue;
+                    uint16_t mlen = (control_rx[2]<<8)|control_rx[3];
+                    if (control_rx[0]!=0x40 || control_rx[1]!=0x40 || mlen<6) {
+                        printf("[CTRL] Invalid control header; dropping partial message\n");
+                        control_rx_len = 0;
+                        continue;
+                    }
+                    if (control_rx_len == mlen) {
+                        uint16_t mid = (control_rx[4]<<8)|control_rx[5];
+                        handle_ctrl_msg(mid, &control_rx[6], mlen-6);
+                        control_rx_len = 0;
+                    }
+                }
+            }
+            return;
+        }
+        if(ctrl==0x40) return;
+    }
+}
+
+/* RFCOMM is a byte stream: one callback may split a link packet or contain
+ * several. Validate a complete frame before acknowledging or dispatching it. */
+static void receive_iap2(uint8_t *data, uint16_t size) {
+    for (int i = 0; i < size; i++) {
+        iap2_rx[iap2_rx_len++] = data[i];
+        while (iap2_rx_len >= 2) {
+            if (iap2_rx[0] != 0xFF ||
+                (iap2_rx[1] != 0x55 && iap2_rx[1] != 0x5A)) {
+                memmove(iap2_rx, iap2_rx + 1, --iap2_rx_len);
+                continue;
+            }
+            if (iap2_rx[1] == 0x55) {
+                if (iap2_rx_len < sizeof(iap2_detect)) break;
+                if (!memcmp(iap2_rx, iap2_detect, sizeof(iap2_detect))) {
+                    handle_iap2_packet(iap2_rx, (uint16_t)iap2_rx_len);
+                    iap2_rx_len = 0;
+                    break;
+                }
+            } else {
+                if (iap2_rx_len < 4) break;
+                uint16_t length = (iap2_rx[2]<<8)|iap2_rx[3];
+                if (length >= 9) {
+                    if (iap2_rx_len < 9) break;
+                    if (ck(iap2_rx, 9) == 0) {
+                        if (iap2_rx_len < length) break;
+                        if (length == 9 || ck(iap2_rx + 9, length - 9) == 0)
+                            handle_iap2_packet(iap2_rx, length);
+                        else
+                            printf("[LINK] Invalid payload checksum; waiting for retransmission\n");
+                        iap2_rx_len = 0;
+                        break;
+                    }
+                }
+            }
+            memmove(iap2_rx, iap2_rx + 1, --iap2_rx_len);
+        }
+    }
+}
+
 static void handler(uint8_t type, uint16_t ch, uint8_t *pkt, uint16_t sz) {
     if(packet_debug_count < 24) {
         printf("[BT] packet type=%u ch=0x%04x len=%u", type, ch, sz);
@@ -1179,47 +1284,7 @@ static void handler(uint8_t type, uint16_t ch, uint8_t *pkt, uint16_t sz) {
     if(type==4&&pkt[0]==0x6c) return;
 
     if(type==7) {
-        if(sz>=6&&memcmp(pkt,iap2_detect,6)==0&&!iap2_detected) {
-            printf("[CP] *** DETECT ECHO ***\n");
-            iap2_detected=1; alarm(0);
-            srand(time(NULL));
-            my_initial_psn=(rand()%254)+1;
-            if (my_initial_psn == 0xFF) my_initial_psn = 0x7F;
-            my_next_psn=my_initial_psn+1;
-            send_syn(); return;
-        }
-        if(sz>=5&&pkt[0]==0xFF&&pkt[1]==0x5A) {
-            uint8_t ctrl=pkt[4],seq=pkt[5],ack=pkt[6],session=pkt[7];
-            if(ctrl==0x10){
-                printf("[CP] RST\n"); link_established=0; usleep(500000);
-                my_initial_psn=(rand()%254)+1;
-                if (my_initial_psn == 0xFF) my_initial_psn = 0x7F;
-                my_next_psn=my_initial_psn+1;
-                send_syn(); return;
-            }
-            if((ctrl&0xC0)==0xC0&&!link_established) {
-                peer_psn=seq;
-                printf("[SYN-ACK] seq=0x%02X ack=0x%02X\n", seq, ack);
-                if(sz>9) {
-                    printf("[SYN-ACK] payload(%d):", sz-9);
-                    for(int i=9;i<sz&&i<40;i++) printf(" %02X",pkt[i]);
-                    printf("\n");
-                }
-                if(ack==my_initial_psn){send_ack();link_established=1;printf("[CP] *** LINK UP ***\n");}
-                return;
-            }
-            peer_psn=seq;
-            if((ctrl&0x40)&&session!=0&&sz>10) {
-                send_ack();
-                uint8_t *m=&pkt[9]; int pl=sz-10;
-                if(pl>=6&&m[0]==0x40&&m[1]==0x40) {
-                    uint16_t mlen=(m[2]<<8)|m[3], mid=(m[4]<<8)|m[5];
-                    handle_ctrl_msg(mid,&m[6],mlen-6);
-                }
-                return;
-            }
-            if(ctrl==0x40) return;
-        }
+        if (active_cid && ch == active_cid) receive_iap2(pkt, sz);
         return;
     }
 
@@ -1274,7 +1339,8 @@ static void handler(uint8_t type, uint16_t ch, uint8_t *pkt, uint16_t sz) {
         if(pkt[2]==2) perform_bt_setup();
         break;
     case 0x04: {
-        bd_addr_t a;memcpy(a,&pkt[2],6);
+        if (sz < 8) break;
+        bd_addr_t a;read_hci_addr(a,&pkt[2]);
         if (bluetooth_handoff_requested) {
             printf("[HANDOFF] ignoring Bluetooth reconnect after Wi-Fi handoff\n");
             break;
@@ -1313,7 +1379,8 @@ static void handler(uint8_t type, uint16_t ch, uint8_t *pkt, uint16_t sz) {
         if(sz > 24) { print_hci_addr("[CP] Link key notification for ", &pkt[2]); printf(" type=0x%02X\n", pkt[24]); }
         break;
     case 0x31:{
-        bd_addr_t a;memcpy(a,&pkt[2],6);
+        if (sz < 8) break;
+        bd_addr_t a;read_hci_addr(a,&pkt[2]);
         if(sz >= 8) { print_hci_addr("[CP] IO capability request from ", &pkt[2]); printf("\n"); }
 #ifdef SHOWCASE_ROOTLESS
         printf("[CP] IO capability reply left to BTdaemon\n");
@@ -1329,7 +1396,8 @@ static void handler(uint8_t type, uint16_t ch, uint8_t *pkt, uint16_t sz) {
         }
         break;
     case 0x33:{
-        bd_addr_t a;memcpy(a,&pkt[2],6);
+        if (sz < 8) break;
+        bd_addr_t a;read_hci_addr(a,&pkt[2]);
 #ifdef SHOWCASE_ROOTLESS
         if(sz >= 12) {
             uint32_t value = (uint32_t)pkt[8] | ((uint32_t)pkt[9] << 8) |

@@ -182,8 +182,6 @@ static void parse_args(int argc, char *argv[]) {
  * A/AAAA records for it, so the iPhone can't resolve it. */
 #define SRV_HOSTNAME  NULL
 #define SOURCE_VERSION "509.0"
-#define CTRL_CONNECT_ATTEMPTS 3   /* attempts per resolved port */
-#define CTRL_RESOLVE_ROUNDS   10  /* how many times to re-resolve */
 #define CTRL_RETRY_SEC 2
 #define MDNS_REANNOUNCE_SECONDS 300
 #define MDNS_REANNOUNCE_INTERVAL 3
@@ -5541,7 +5539,7 @@ static void ctrl_send_connect(int sock, const char *host) {
     printf("[CTRL] Sending:\n%s", request);
     ssize_t sent = send(sock, request, reqlen, 0);
     printf("[CTRL] Sent %zd bytes\n", sent);
-    if (sent <= 0) { close(sock); goto done; }
+    if (sent <= 0) goto done;
 
     /* TCP keepalive to prevent idle timeout */
     int yes = 1;
@@ -5632,96 +5630,26 @@ done:
 
 static void ctrl_connect_thread(void *ctx) {
     (void)ctx;
-
-    /* ── Phase 1: Wait for iPhone to actually be on the network ──
-     * mDNS browse returns cached results from previous sessions, so we
-     * often fire before the BT handshake has even happened. We probe
-     * silently with short timeouts until the host responds. */
-    printf("[CTRL] iPhone service found (likely cached). "
-           "Waiting for BT handshake...\n");
-    fflush(stdout);
-
-    int waitSecs = 0;
+    /* Cached ports and a rejected first /connect are transient during Wi-Fi
+     * handoff. Keep this single worker alive and resolve anew after failure
+     * or closure, including when the phone forgets and rejoins the hotspot. */
+    unsigned int round = 0;
     while (1) {
         ResolveResult rr = { .resolved = false };
-        if (!resolve_ctrl_port(&rr)) {
-            sleep(1); waitSecs += 1;
-            if (waitSecs % 30 == 0)
-                printf("[CTRL] Still waiting for iPhone... (%ds)\n", waitSecs);
-            continue;
-        }
-
-        /* Ports change between sessions. Re-resolve promptly so a cached
-         * endpoint cannot stall the new Bluetooth-to-Wi-Fi handoff. */
-        int sock = try_connect(rr.host, rr.port, g_ctrlIfIndex, false, 1);
-        if (sock >= 0) {
-            /* Connected on first probe! */
-            ctrl_send_connect(sock, rr.host);
-            return;
-        }
-
-        int connectError = errno;
-        printf("[CTRL] Probe %s:%u failed: %s\n", rr.host,
-               (unsigned)rr.port, strerror(connectError));
-        fflush(stdout);
-        if (connectError == ECONNREFUSED) {
-            /* iPhone IS on the network (TCP RST = host reachable).
-             * This port is stale — move to Phase 2 with re-resolve. */
-            printf("[CTRL] iPhone is online! (port %u stale, re-resolving)\n",
-                   (unsigned)rr.port);
-            break;
-        }
-
-        /* EHOSTDOWN / ETIMEDOUT / EHOSTUNREACH — not on network yet */
-        sleep(1); waitSecs += 1;
-        if (waitSecs % 30 == 0 && waitSecs > 0) {
-            printf("[CTRL] Still waiting for iPhone... (%ds)\n", waitSecs);
-            fflush(stdout);
-        }
-    }
-
-    /* ── Phase 2: iPhone is reachable — resolve & connect ──
-     * Now we do the verbose re-resolve loop since we know the
-     * iPhone is actually on the network. */
-    for (int round = 1; round <= CTRL_RESOLVE_ROUNDS; round++) {
-        ResolveResult rr = { .resolved = false };
-        printf("[CTRL] Resolve round %d/%d...\n", round, CTRL_RESOLVE_ROUNDS);
-
-        if (!resolve_ctrl_port(&rr)) {
-            printf("[CTRL] Resolve failed, retrying in %ds...\n", CTRL_RETRY_SEC * 2);
-            sleep(CTRL_RETRY_SEC * 2);
-            continue;
-        }
-
-        printf("[CTRL] Resolved: %s:%u\n", rr.host, (unsigned)rr.port);
-
-        for (int attempt = 1; attempt <= CTRL_CONNECT_ATTEMPTS; attempt++) {
-            printf("[CTRL] Connect attempt %d/%d to %s:%u\n",
-                   attempt, CTRL_CONNECT_ATTEMPTS,
-                   rr.host, (unsigned)rr.port);
-
-            int sock = try_connect(rr.host, rr.port, g_ctrlIfIndex, true, 5);
+        round++;
+        if (resolve_ctrl_port(&rr)) {
+            int sock = try_connect(rr.host, rr.port, g_ctrlIfIndex, false, 1);
             if (sock >= 0) {
                 ctrl_send_connect(sock, rr.host);
-                return;
+            } else if (round == 1 || round % 15 == 0) {
+                printf("[CTRL] Waiting for %s:%u: %s (round %u)\n",
+                       rr.host, (unsigned)rr.port, strerror(errno), round);
             }
-
-            if (errno == ECONNREFUSED) {
-                printf("[CTRL] Port %u refused — re-resolving\n",
-                       (unsigned)rr.port);
-                break;
-            }
-            if (attempt < CTRL_CONNECT_ATTEMPTS) {
-                printf("[CTRL] Retrying in %ds...\n", CTRL_RETRY_SEC);
-                sleep(CTRL_RETRY_SEC);
-            }
+        } else if (round == 1 || round % 15 == 0) {
+            printf("[CTRL] Waiting for fresh control service (round %u)\n", round);
         }
-
-        if (round < CTRL_RESOLVE_ROUNDS) {
-            sleep(CTRL_RETRY_SEC);
-        }
+        sleep(CTRL_RETRY_SEC);
     }
-    printf("[CTRL] *** ALL RESOLVE ROUNDS EXHAUSTED ***\n");
 }
 
 /* ═══════════════════════════════════════════════════════════════
